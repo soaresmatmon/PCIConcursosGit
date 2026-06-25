@@ -1,7 +1,8 @@
+import os
+import sys
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
-import os
 import requests
 from bs4 import BeautifulSoup
 import re
@@ -12,21 +13,62 @@ from math import radians, sin, cos, sqrt, atan2
 import urllib.parse
 from googleapiclient.discovery import build
 
+print(">>> RUNNING concursos.py v2026-06-09-col-H <<<")
+
 # =====================================
-# 0) Helpers
+# 0) Single-instance lock (interactive for manual runs)
+# =====================================
+LOCK_FILE = r"C:\Users\mateu\OneDrive\Área de Trabalho\Concursos\pci_concursos.lock"
+
+
+def acquire_lock_interactive():
+    """Try to acquire the lock; if a stale lock exists, ask user whether to delete and retry."""
+    if os.path.exists(LOCK_FILE):
+        print(f"🚫 Lock file already exists: {LOCK_FILE}")
+        answer = input("Delete existing lock and continue? [y/N]: ").strip().lower()
+        if answer == "y":
+            try:
+                os.remove(LOCK_FILE)
+                print("🔧 Old lock removed, retrying acquire...")
+            except Exception as e:
+                print(f"⚠️ Could not remove existing lock: {e}")
+                sys.exit(1)
+        else:
+            print("❌ Exiting to avoid possible double run.")
+            sys.exit(0)
+
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+        print(f"🔒 Lock acquired: {LOCK_FILE}")
+    except FileExistsError:
+        print("🚫 Another instance just acquired the lock. Exiting.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"⚠️ Could not create lock file {LOCK_FILE}: {e}. Exiting to avoid duplicates.")
+        sys.exit(1)
+
+
+acquire_lock_interactive()
+
+# =====================================
+# 1) Helpers
 # =====================================
 def normalize_text(text):
     text = text.lower().replace("\xa0", " ")
     text = unicodedata.normalize("NFKD", text)
     return "".join(c for c in text if not unicodedata.combining(c))
 
+
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
     dlon = radians(lon2 - lon1)
     dlat = radians(lat2 - lat1)
-    a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
+
 
 def make_maps_link(cidade, estado):
     query = urllib.parse.quote(f"{cidade}, {estado}, Brasil")
@@ -54,7 +96,7 @@ def safe_sheet_write(action_desc, func, *args, **kwargs):
     return None
 
 # =====================================
-# 1) Google Sheets Authentication (Service Account)
+# 2) Google Sheets Authentication (Service Account)
 # =====================================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SERVICE_ACCOUNT_FILE = r"C:\Users\mateu\OneDrive\Área de Trabalho\Concursos\pci-concursos-tracker-1eedab4e1dbd.json"
@@ -68,51 +110,112 @@ except Exception as e:
     raise SystemExit(1)
 
 # =====================================
-# 2) Open target sheet
+# 3) Open target sheet
 # =====================================
 SHEET_ID = "1lFQFIs6Y6t2lhwb6SE88QiC-X4Rnsmh7hyCze23fM4Y"
 sheet = gc.open_by_key(SHEET_ID)
 
-def get_or_create_worksheet(sheet, title, cols):
+
+def get_or_create_worksheet(sheet_obj, title, cols):
     try:
-        return sheet.worksheet(title)
+        return sheet_obj.worksheet(title)
     except gspread.WorksheetNotFound:
-        return sheet.add_worksheet(title=title, rows="1000", cols=str(cols))
+        return sheet_obj.add_worksheet(title=title, rows="1000", cols=str(cols))
+
 
 ws_concursos = get_or_create_worksheet(sheet, "concursos", 20)
 ws_logs = get_or_create_worksheet(sheet, "logs", 5)
 ws_geo = get_or_create_worksheet(sheet, "geocodes_cache", 4)
 
 # =====================================
-# 3) Load geocode cache
+# 4) Load geocode cache
 # =====================================
 geo_records = ws_geo.get_all_records()
 geo_cache = {r["cidade"].lower(): (r["lat"], r["lon"]) for r in geo_records if "cidade" in r}
 
-def get_city_coords(city):
+# ─────────────────────────────────────────────────────────────────────
+# FIX 1: get_city_coords — include estado in query, log empty
+#         responses, handle 429 rate-limits, use policy-compliant UA
+# ─────────────────────────────────────────────────────────────────────
+NOMINATIM_UA = "PCI-Concursos-Tracker/2.0 (mateus.concursos@example.com)"
+# ↑ Replace the email with a real contact address — Nominatim's terms
+#   require a unique, identifying User-Agent. Using "Mozilla/5.0"
+#   (the old value) violates their policy and can trigger soft-blocks
+#   that return 200 + empty JSON silently.
+
+
+def get_city_coords(city, estado=None):
+    """
+    Geocode `city` via Nominatim.
+
+    FIX 1a – estado is now used in the query string, removing ambiguity
+              for small/common city names (e.g. "São Martinho" exists in
+              multiple states; without the state Nominatim may return the
+              wrong one or nothing at all).
+
+    FIX 1b – Empty-response logging: the original code had no output when
+              Nominatim returned status 200 + [] (empty list). These failures
+              were completely invisible in the logs, making debugging
+              impossible. Now they are always printed.
+
+    FIX 1c – 429 / rate-limit handling: if Nominatim returns HTTP 429 we
+              back off exponentially instead of crashing silently.
+
+    FIX 1d – Policy-compliant User-Agent (see NOMINATIM_UA above).
+    """
     city_norm = city.lower().strip()
     if city_norm in geo_cache:
         return geo_cache[city_norm]
-    print(f"🌍 Geocoding: {city}")
+
+    # Build query — prefer city + state for specificity
+    query = f"{city}, {estado}, Brasil" if estado else f"{city}, Brasil"
+    print(f"🌍 Geocoding: {query}")
+
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": f"{city}, Brasil", "format": "json", "limit": 1}
-    try:
-        resp = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200 and resp.json():
-            data = resp.json()[0]
-            lat, lon = float(data["lat"]), float(data["lon"])
-            geo_cache[city_norm] = (lat, lon)
-            safe_sheet_write("update geocode cache", ws_geo.append_row,
-                             [city, lat, lon, datetime.now().isoformat()],
-                             value_input_option="USER_ENTERED")
-            time.sleep(1)
-            return lat, lon
-    except Exception as e:
-        print(f"⚠️ Erro ao geocodificar {city}: {e}")
+    params = {"q": query, "format": "json", "limit": 1, "countrycodes": "br"}
+    headers = {"User-Agent": NOMINATIM_UA}
+
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+
+            # FIX 1c — explicit 429 handling
+            if resp.status_code == 429:
+                wait_s = 30 * (attempt + 1)
+                print(f"⏳ Nominatim rate-limited (429). Waiting {wait_s}s before retry {attempt + 1}/3…")
+                time.sleep(wait_s)
+                continue
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+                    geo_cache[city_norm] = (lat, lon)
+                    safe_sheet_write(
+                        "update geocode cache",
+                        ws_geo.append_row,
+                        [city, lat, lon, datetime.now().isoformat()],
+                        value_input_option="RAW",
+                    )
+                    time.sleep(1.5)  # more conservative than the old 1 s
+                    return lat, lon
+                else:
+                    # FIX 1b — log the empty response (was completely silent before)
+                    print(f"⚠️ Nominatim returned 0 results for: '{query}'. City may be too small or name too ambiguous.")
+                    break  # no point retrying an empty result
+            else:
+                print(f"⚠️ Nominatim HTTP {resp.status_code} for '{query}'.")
+
+        except Exception as e:
+            print(f"⚠️ Erro ao geocodificar '{city}' (attempt {attempt + 1}/3): {e}")
+
+        if attempt < 2:
+            time.sleep(5 * (attempt + 1))
+
     return None
 
 # =====================================
-# 4) Scraper
+# 5) Scraper
 # =====================================
 URL = "https://www.pciconcursos.com.br/concursos/sul/"
 response = requests.get(URL)
@@ -121,6 +224,7 @@ soup = BeautifulSoup(response.text, "html.parser")
 
 concursos = []
 today = datetime.today()
+
 for na_div in soup.find_all("div", class_="na"):
     ca_div = na_div.find("div", class_="ca")
     if not ca_div:
@@ -128,16 +232,25 @@ for na_div in soup.find_all("div", class_="na"):
     a = ca_div.find("a", href=True)
     if not a:
         continue
+
     text = a.get_text(strip=True)
-    if not text.startswith("Prefeitura de "):
+    PREFIXES = ("Prefeitura de ", "Câmara de Vereadores de ", "Câmara de ")
+    if not text.startswith(PREFIXES):
         continue
-    cidade = text.replace("Prefeitura de ", "").strip()
+
+    for prefix in PREFIXES:
+        if text.startswith(prefix):
+            cidade = text[len(prefix):].strip()
+            break
+
     link = a["href"]
     titulo = a.get("title", "")
     fonte_url = URL
+
     cd_div = na_div.find("div", class_="cd")
     ce_div = na_div.find("div", class_="ce")
     cc_div = na_div.find("div", class_="cc")
+
     estado = cc_div.get_text(strip=True) if cc_div else ""
     vagas_info = cd_div.get_text(" ", strip=True) if cd_div else ""
     ca_text = ca_div.get_text(" ", strip=True) if ca_div else ""
@@ -149,6 +262,9 @@ for na_div in soup.find_all("div", class_="na"):
         ("medio" in ca_text_norm or "medio / superior" in ca_text_norm or "superior" in ca_text_norm)
         and ("professor" not in ca_text_norm)
     )
+    # Conservative rule: True only when the normalized text explicitly indicates concurso público.
+    # Anything else, including processo seletivo or no clear wording, defaults to False.
+    is_concurso_publico = "concurso" in titulo
 
     prazo = ""
     if ce_div:
@@ -157,6 +273,7 @@ for na_div in soup.find_all("div", class_="na"):
         dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", prazo_raw)
         if dates:
             prazo = dates[-1]
+
     if prazo:
         try:
             prazo_date = datetime.strptime(prazo, "%d/%m/%Y")
@@ -184,33 +301,77 @@ for na_div in soup.find_all("div", class_="na"):
         "fonte_url": fonte_url,
         "coletado_em": datetime.now().isoformat(),
         "is_varios_cargos_true": is_varios_cargos_true,
-        "is_escolaridade_EMouSuperior&Cargo_não_Professor_truer": is_escolaridade_EMouSuperior_e_Cargo_nao_Professor,
+        "is_escolaridade_EMouSuperior&Cargo_não_Professor_true": is_escolaridade_EMouSuperior_e_Cargo_nao_Professor,
+        "is_concurso_publico": is_concurso_publico,
     }
 
-    concurso["id_hash"] = hashlib.md5(
+    hash_core = hashlib.md5(
         f"{concurso['cidade']}_{concurso['estado']}_{concurso['link_edital']}".encode("utf-8")
     ).hexdigest()[:10]
+    concurso["id_hash"] = f"h_{hash_core}"
 
     concursos.append(concurso)
 
 print(f"✅ Encontradas {len(concursos)} prefeituras válidas")
 
 # =====================================
-# 5) Save to Google Sheets (Enhanced duplicate prevention)
+# 6) Save to Google Sheets (Enhanced duplicate prevention)
 # =====================================
 lat_osorio, lon_osorio = -29.8884, -50.2668
 lat_floripa, lon_floripa = -27.5954, -48.5480
 lat_curitiba, lon_curitiba = -25.4284, -49.2733
 
+# Column order aligned to the manually shifted sheet:
+# A  id_hash
+# B  coletado_em
+# C  fonte_url
+# D  estado
+# E  vagas
+# F  is_varios_cargos_true
+# G  is_escolaridade_EMouSuperior&Cargo_não_Professor_true
+# H  is_concurso_publico
+# I  cidade
+# J  orgao
+# K  salario
+# L  Review
+# M  Not Interested
+# N  titulo
+# O  prazo_de_inscricao
+# P  link_edital
+# Q  dist_km_osorio
+# R  dist_km_floripa
+# S  dist_km_curitiba
+# T  maps_link
 columns = [
-    "id_hash", "coletado_em", "fonte_url", "estado",
-    "vagas", "is_varios_cargos_true",
-    "is_escolaridade_EMouSuperior&Cargo_não_Professor_truer",
-    "cidade", "orgao", "salario",
-    "Review", "Not Interested",
-    "titulo", "prazo_de_inscricao", "link_edital",
-    "dist_km_osorio", "dist_km_floripa", "dist_km_curitiba", "maps_link"
+    "id_hash",
+    "coletado_em",
+    "fonte_url",
+    "estado",
+    "vagas",
+    "is_varios_cargos_true",
+    "is_escolaridade_EMouSuperior&Cargo_não_Professor_true",
+    "is_concurso_publico",
+    "cidade",
+    "orgao",
+    "salario",
+    "Review",
+    "Not Interested",
+    "titulo",
+    "prazo_de_inscricao",
+    "link_edital",
+    "dist_km_osorio",
+    "dist_km_floripa",
+    "dist_km_curitiba",
+    "maps_link",
 ]
+
+# Distance column positions in the sheet (1-based, letters for A1 notation)
+# Matches the `columns` list above: index 16→Q, 17→R, 18→S
+DIST_OSORIO_COL = "Q"
+DIST_FLORIPA_COL = "R"
+DIST_CURITIBA_COL = "S"
+CIDADE_COL_IDX = columns.index("cidade")
+ESTADO_COL_IDX = columns.index("estado")
 
 # 1) Local dedupe (pre-run)
 unique_concursos = {c["id_hash"]: c for c in concursos}
@@ -223,77 +384,72 @@ written_hashes = set()  # per-run memory
 added = 0
 failed_rows = []
 
-# ---------------------------------------------------------------------
-# NEW: real-time duplicate check (reads last 30 rows only = fast)
-# ---------------------------------------------------------------------
+
 def hash_exists_in_last_rows(ws, hid, rows_to_check=30):
     """Fast duplicate detection to prevent ghost double-writes."""
     try:
         all_values = ws.get_all_values()
         if not all_values:
             return False
-
-        # Protect header
         data_rows = all_values[1:]
-
-        # Check last N rows
         for row in data_rows[-rows_to_check:]:
             if len(row) > 0 and row[0] == hid:
                 return True
         return False
-
     except Exception as e:
         print(f"⚠️ Real-time duplicate check failed: {e}")
-        # Fail safe: assume NOT duplicate so script continues
         return False
 
-# ---------------------------------------------------------------------
-# NEW: enhanced safe append with real-time dedupe
-# ---------------------------------------------------------------------
-def safe_append_concurso_row(concurso_hash, row, ws_concursos, attempt_delays=[5, 15, 30]):
+
+# ─────────────────────────────────────────────────────────────────────
+# FIX 2: safe_append_concurso_row — mutable default argument removed.
+#         Using `attempt_delays=None` + in-body default avoids the
+#         Python pitfall where the default list is shared across calls.
+#         Also moved the duplicate-check OUTSIDE the retry loop — the
+#         original called get_all_values() on every retry attempt,
+#         which was expensive and redundant.
+# ─────────────────────────────────────────────────────────────────────
+def safe_append_concurso_row(concurso_hash, row, ws_concursos_obj, attempt_delays=None):
+    if attempt_delays is None:
+        attempt_delays = [5, 15, 30]
+
+    # FIX 2b — check for duplicate once, before the retry loop
+    if hash_exists_in_last_rows(ws_concursos_obj, concurso_hash):
+        print(f"⛔ Real-time duplicate detected before write → skipping hash {concurso_hash}")
+        return True
+
     for attempt, delay in enumerate(attempt_delays, start=1):
-
-        # ---- REAL-TIME DUPLICATE CHECK BEFORE RETRYING ----
-        if hash_exists_in_last_rows(ws_concursos, concurso_hash):
-            print(f"⛔ Real-time duplicate detected before write → skipping hash {concurso_hash}")
-            return True  # treat as success (row already exists)
-
         try:
             safe_sheet_write(
                 f"append concurso row (try {attempt})",
-                ws_concursos.append_row,
+                ws_concursos_obj.append_row,
                 row,
-                value_input_option="USER_ENTERED"
+                value_input_option="RAW",
             )
             print(f"✅ Row success on attempt {attempt}")
             return True
-
         except Exception as e:
-            print(f"⚠️ Failed attempt {attempt}, waiting {delay} sec before retry. Error: {e}")
-
+            print(f"⚠️ Failed attempt {attempt}, waiting {delay}s before retry. Error: {e}")
             if attempt < len(attempt_delays):
                 time.sleep(delay)
 
     print(f"❌ All attempts failed for hash {concurso_hash}, skipping.")
     return False
 
-# ---------------------------------------------------------------------
-# MAIN WRITE LOOP (unchanged logic, upgraded safety)
-# ---------------------------------------------------------------------
+
 print("About to write the following hashes:", [c["id_hash"] for c in deduped_concursos])
 
 for concurso in deduped_concursos:
     hid = concurso["id_hash"]
 
-    # Normal duplicate protections
     if hid in existing_hashes or hid in written_hashes:
         print(f"⚠️ Skipping duplicate id_hash: {hid}")
         continue
 
     written_hashes.add(hid)
 
-    # Compute distances
-    coords = get_city_coords(concurso["cidade"])
+    # FIX 1 — pass estado so the query is unambiguous
+    coords = get_city_coords(concurso["cidade"], concurso.get("estado"))
     if coords:
         lat_cidade, lon_cidade = coords
         concurso["dist_km_osorio"] = round(haversine(lat_osorio, lon_osorio, lat_cidade, lon_cidade), 1)
@@ -304,7 +460,6 @@ for concurso in deduped_concursos:
 
     concurso["maps_link"] = make_maps_link(concurso["cidade"], concurso["estado"])
 
-    # Create row data with defaults
     row = [
         concurso.get(col, False if col in ["Review", "Not Interested"] else "")
         for col in columns
@@ -320,135 +475,432 @@ for concurso in deduped_concursos:
 print(f"📝 {added} novos concursos adicionados (sem duplicatas).")
 print(f"⚠️ Rows not saved after 3 attempts: {failed_rows}")
 
-
 # =====================================
-# 6) Log run
+# 7) Log run
 # =====================================
 safe_sheet_write(
     "append log row",
     ws_logs.append_row,
     [datetime.now().isoformat(), f"{added} novos concursos adicionados", "Sul (RS/SC/PR)"],
-    value_input_option="USER_ENTERED"
+    value_input_option="USER_ENTERED",
 )
 
 # -----------------------------
-# Extra: update Filter Views to cover all rows (A:S) and log that action
+# Extra: update Filter Views
 # -----------------------------
-def update_filter_views(spreadsheet_id, tab_name, creds, end_row_index=1000000, end_col_index=19):
+def update_filter_views(spreadsheet_id, tab_name, creds_obj, end_row_index=1000000, end_col_index=20):
     try:
-        service = build('sheets', 'v4', credentials=creds)
+        service = build("sheets", "v4", credentials=creds_obj)
         meta = service.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
-            fields='sheets(properties(sheetId,title),filterViews)'
+            fields="sheets(properties(sheetId,title),filterViews)",
         ).execute()
-        target_sheet = next((s for s in meta.get('sheets', []) if s['properties']['title'] == tab_name), None)
+        target_sheet = next(
+            (s for s in meta.get("sheets", []) if s["properties"]["title"] == tab_name),
+            None,
+        )
         if not target_sheet:
             print(f"⚠️ update_filter_views: sheet/tab '{tab_name}' not found.")
             return 0
-        sheet_id_num = target_sheet['properties']['sheetId']
-        filter_views = target_sheet.get('filterViews', [])
+        sheet_id_num = target_sheet["properties"]["sheetId"]
+        filter_views = target_sheet.get("filterViews", [])
         if not filter_views:
             print(f"ℹ️ update_filter_views: no filter views in '{tab_name}'.")
             return 0
-        requests = []
+        requests_list = []
         for fv in filter_views:
-            fv_id = fv.get('filterViewId')
-            fv_title = fv.get('title', '')
+            fv_id = fv.get("filterViewId")
+            fv_title = fv.get("title", "")
             new_range = {
                 "sheetId": sheet_id_num,
                 "startRowIndex": 0,
                 "endRowIndex": end_row_index,
                 "startColumnIndex": 0,
-                "endColumnIndex": end_col_index
+                "endColumnIndex": end_col_index,
             }
-            requests.append({
-                "updateFilterView": {
-                    "filter": {
-                        "filterViewId": fv_id,
-                        "title": fv_title,
-                        "range": new_range
-                    },
-                    "fields": "range"
+            requests_list.append(
+                {
+                    "updateFilterView": {
+                        "filter": {
+                            "filterViewId": fv_id,
+                            "title": fv_title,
+                            "range": new_range,
+                        },
+                        "fields": "range",
+                    }
                 }
-            })
-        if requests:
-            body = {"requests": requests}
-            service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
-            print(f"✅ update_filter_views: Updated {len(requests)} filter view(s) in '{tab_name}'.")
-            return len(requests)
+            )
+        if requests_list:
+            body = {"requests": requests_list}
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id, body=body
+            ).execute()
+            print(f"✅ update_filter_views: Updated {len(requests_list)} filter view(s) in '{tab_name}'.")
+            return len(requests_list)
         else:
             return 0
     except Exception as e:
         print(f"⚠️ update_filter_views error: {e}")
         return 0
 
+
 try:
     updated_filters_count = update_filter_views(SHEET_ID, "concursos", creds)
     safe_sheet_write(
         "log filter views update",
         ws_logs.append_row,
-        [datetime.now().isoformat(), f"Filter views updated in 'concursos': {updated_filters_count}"],
-        value_input_option="USER_ENTERED"
+        [
+            datetime.now().isoformat(),
+            f"Filter views updated in 'concursos': {updated_filters_count}",
+        ],
+        value_input_option="USER_ENTERED",
     )
 except Exception as e:
     print(f"⚠️ Failed to update filter views or to log the event: {e}")
 
 # =====================================
-# 7) Check and move expired concursos
+# 8) Check and move expired concursos (NO OVERWRITE)
 # =====================================
-def process_concursos_validity(ws_source, ws_expired, ws_logs):
-    print("\n🔍 Checking concursos for expiration status...")
-    today = datetime.today().date()
+
+def _sheet_id_from_ws(ws):
+    return ws._properties["sheetId"]
+
+
+def _chunked(iterable, size):
+    for i in range(0, len(iterable), size):
+        yield iterable[i : i + size]
+
+
+def batch_delete_rows(service, spreadsheet_id, sheet_id, row_numbers_1based, chunk_size=200):
+    """Delete rows in a single sheet using Sheets API."""
+    if not row_numbers_1based:
+        return 0
+    rows_desc = sorted(set(row_numbers_1based), reverse=True)
+    deleted = 0
+    for chunk in _chunked(rows_desc, chunk_size):
+        requests_body = []
+        for r in chunk:
+            requests_body.append({
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": r - 1,
+                        "endIndex": r
+                    }
+                }
+            })
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests_body}
+        ).execute()
+        deleted += len(chunk)
+    return deleted
+
+
+def append_many_rows(ws, rows, value_input_option="USER_ENTERED"):
+    if not rows:
+        return
+    if hasattr(ws, "append_rows"):
+        ws.append_rows(rows, value_input_option=value_input_option)
+    else:
+        for row in rows:
+            ws.append_row(row, value_input_option=value_input_option)
+
+
+def move_expired_concursos_inplace(ws_source, ws_expired, ws_logs_sheet, spreadsheet_id, creds_obj):
+    print("\n🔍 Checking concursos for expiration status (in-place delete/move)...")
+    service = build("sheets", "v4", credentials=creds_obj)
+
     data = ws_source.get_all_values()
     if not data or len(data) < 2:
         print("⚠️ No data found in source sheet.")
         return
+
     headers = data[0]
     rows = data[1:]
-    prazo_index = headers.index("prazo_de_inscricao") if "prazo_de_inscricao" in headers else 13
-    valid_rows, expired_rows = [], []
-    for row in rows:
-        if len(row) <= prazo_index:
+
+    try:
+        prazo_idx = headers.index("prazo_de_inscricao")
+    except ValueError:
+        print("❌ Column 'prazo_de_inscricao' not found. Skipping expiration step.")
+        return
+
+    today_local = datetime.today().date()
+    expired_to_move = []
+    expired_row_numbers = []
+
+    for i, row in enumerate(rows, start=2):
+        if len(row) <= prazo_idx:
             continue
-        prazo_str = row[prazo_index].strip()
+        prazo_str = row[prazo_idx].strip()
         try:
             prazo_date = datetime.strptime(prazo_str, "%d/%m/%Y").date()
-            (valid_rows if prazo_date >= today else expired_rows).append(row)
         except ValueError:
             continue
+        if prazo_date < today_local:
+            row_norm = row + [""] * (len(headers) - len(row))
+            expired_to_move.append(row_norm)
+            expired_row_numbers.append(i)
+
     print(f"📊 Total concursos found: {len(rows)}")
-    print(f"✅ Valid: {len(valid_rows)} | ❌ Expired: {len(expired_rows)}")
-    safe_sheet_write("overwrite valid concursos", ws_source.update,
-                     range_name="A1", values=[headers] + valid_rows,
-                     value_input_option="USER_ENTERED")
-    if expired_rows:
-        existing_expired = ws_expired.get_all_values()
-        next_row = len(existing_expired) + 1
-        safe_sheet_write(f"append {len(expired_rows)} expired concursos",
-                         ws_expired.update, range_name=f"A{next_row}", values=expired_rows,
-                         value_input_option="USER_ENTERED")
-        safe_sheet_write("log expired move", ws_logs.append_row,
-                         [datetime.now().isoformat(),
-                          f"{len(expired_rows)} concursos expirados movidos para '{ws_expired.title}'"],
-                         value_input_option="USER_ENTERED")
-        print(f"📦 {len(expired_rows)} expired concursos moved.")
-    else:
+    print(f"❌ Expired to move: {len(expired_to_move)}")
+
+    if not expired_to_move:
         print("ℹ️ No expired concursos found.")
+        return
+
+    expired_values = ws_expired.get_all_values()
+    if not expired_values:
+        safe_sheet_write(
+            "write header concursos_expirados",
+            ws_expired.update,
+            "A1",
+            [headers],
+            value_input_option="USER_ENTERED",
+        )
+
+    safe_sheet_write(
+        f"append {len(expired_to_move)} expired concursos",
+        append_many_rows,
+        ws_expired,
+        expired_to_move,
+        "USER_ENTERED",
+    )
+
+    deleted = batch_delete_rows(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        sheet_id=_sheet_id_from_ws(ws_source),
+        row_numbers_1based=expired_row_numbers,
+    )
+
+    safe_sheet_write(
+        "log expired move",
+        ws_logs_sheet.append_row,
+        [datetime.now().isoformat(), f"{deleted} concursos expirados movidos para '{ws_expired.title}'"],
+        value_input_option="USER_ENTERED",
+    )
+
+    print(f"📦 Moved+deleted expired rows: {deleted}")
+
 
 try:
     ws_expired = sheet.worksheet("concursos_expirados")
 except gspread.WorksheetNotFound:
     ws_expired = sheet.add_worksheet(title="concursos_expirados", rows="1000", cols="20")
-process_concursos_validity(ws_concursos, ws_expired, ws_logs)
+
+move_expired_concursos_inplace(ws_concursos, ws_expired, ws_logs, SHEET_ID, creds)
 
 # =====================================
-# 8) Final summary feedback
+# 9) Automatic dedupe by id_hash (NO OVERWRITE)
+# =====================================
+def dedupe_concursos_by_hash_inplace(ws_concursos_obj, ws_logs_sheet, spreadsheet_id, creds_obj):
+    print("\n🧹 Running automatic dedupe by id_hash (in-place delete)...")
+    service = build("sheets", "v4", credentials=creds_obj)
+
+    data = ws_concursos_obj.get_all_values()
+    if not data or len(data) < 2:
+        print("⚠️ Nothing to dedupe (empty or header only).")
+        return
+
+    headers = data[0]
+    rows = data[1:]
+
+    try:
+        id_hash_idx = headers.index("id_hash")
+    except ValueError:
+        print("❌ Column 'id_hash' not found, skipping dedupe.")
+        return
+
+    seen = set()
+    duplicate_row_numbers = []
+
+    for i, row in enumerate(rows, start=2):
+        hid = row[id_hash_idx].strip() if len(row) > id_hash_idx else ""
+        if not hid:
+            continue
+        if hid in seen:
+            duplicate_row_numbers.append(i)
+        else:
+            seen.add(hid)
+
+    if not duplicate_row_numbers:
+        print("✅ No duplicate id_hash values found.")
+        return
+
+    deleted = batch_delete_rows(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        sheet_id=_sheet_id_from_ws(ws_concursos_obj),
+        row_numbers_1based=duplicate_row_numbers,
+    )
+
+    safe_sheet_write(
+        "log dedupe",
+        ws_logs_sheet.append_row,
+        [datetime.now().isoformat(), f"Dedupe removed {deleted} duplicate rows by id_hash"],
+        value_input_option="USER_ENTERED",
+    )
+
+    print(f"✅ Dedupe finished. Removed {deleted} rows.")
+
+
+dedupe_concursos_by_hash_inplace(ws_concursos, ws_logs, SHEET_ID, creds)
+
+# ─────────────────────────────────────────────────────────────────────
+# FIX 3: backfill_missing_distances — NEW FUNCTION
+#
+# ROOT CAUSE RECAP:
+#   When get_city_coords() returns None at insert-time (e.g. because
+#   Nominatim returned an empty result or was rate-limiting), the row
+#   is written with empty distance columns. Because the deduplication
+#   is hash-based, subsequent runs skip those rows entirely — the
+#   distances remain empty forever.
+#
+# This function scans the live sheet for rows where all three distance
+# columns are blank, re-geocodes each city (now with estado included),
+# and patches the cells via a single Sheets API batchUpdate call.
+# It runs AFTER the dedupe step so the sheet is clean.
+# ─────────────────────────────────────────────────────────────────────
+def backfill_missing_distances(ws_source, ws_logs_sheet, spreadsheet_id, creds_obj, tab_name="concursos"):
+    print("\n🔧 Backfill: scanning for rows with missing distances…")
+    service = build("sheets", "v4", credentials=creds_obj)
+
+    data = ws_source.get_all_values()
+    if not data or len(data) < 2:
+        print("⚠️ Sheet empty — nothing to backfill.")
+        return
+
+    headers = data[0]
+    rows = data[1:]
+
+    # Locate columns by name (tolerant of the header renaming visible in the ODS)
+    def _find_col(candidates):
+        """Return the first matching 0-based index from a list of candidate names."""
+        for name in candidates:
+            try:
+                return headers.index(name)
+            except ValueError:
+                pass
+        return None
+
+    cidade_idx = _find_col(["cidade"])
+    estado_idx = _find_col(["estado"])
+    osorio_idx = _find_col(["dist_km_osorio", "Distancia Osório Km)", "Distância Osório (Km)"])
+    floripa_idx = _find_col(["dist_km_floripa", "Distância Floripa (Km)", "Distancia Floripa (Km)"])
+    curitiba_idx = _find_col(["dist_km_curitiba", "Distancia Curitiba", "Distância Curitiba (Km)"])
+
+    missing_cols = [
+        n for n, i in [
+            ("cidade", cidade_idx),
+            ("estado", estado_idx),
+            ("dist_km_osorio", osorio_idx),
+            ("dist_km_floripa", floripa_idx),
+            ("dist_km_curitiba", curitiba_idx),
+        ] if i is None
+    ]
+    if missing_cols:
+        print(f"❌ Backfill aborted — could not find columns: {missing_cols}")
+        return
+
+    # Convert 0-based column index → A1 letter (A=0, P=15, etc.)
+    def col_letter(idx):
+        result = ""
+        n = idx
+        while True:
+            result = chr(ord("A") + n % 26) + result
+            n = n // 26 - 1
+            if n < 0:
+                break
+        return result
+
+    osorio_letter = col_letter(osorio_idx)
+    floripa_letter = col_letter(floripa_idx)
+    curitiba_letter = col_letter(curitiba_idx)
+
+    updates = []   # list of {"range": ..., "values": [[...]]}
+    repaired = 0
+
+    for i, row in enumerate(rows, start=2):   # sheet row 2 = first data row
+        # Check if all three distance cells are blank
+        def cell(idx):
+            return row[idx].strip() if len(row) > idx else ""
+
+        if cell(osorio_idx) != "" and cell(floripa_idx) != "" and cell(curitiba_idx) != "":
+            continue   # already has distances
+
+        cidade = cell(cidade_idx)
+        estado = cell(estado_idx)
+
+        if not cidade:
+            continue
+
+        coords = get_city_coords(cidade, estado)
+        if not coords:
+            print(f"  ⚠️ Still can't geocode '{cidade}' ({estado}) — skipping row {i}.")
+            continue
+
+        lat_c, lon_c = coords
+        d_osorio = round(haversine(lat_osorio, lon_osorio, lat_c, lon_c), 1)
+        d_floripa = round(haversine(lat_floripa, lon_floripa, lat_c, lon_c), 1)
+        d_curitiba = round(haversine(lat_curitiba, lon_curitiba, lat_c, lon_c), 1)
+
+        print(
+            f"  ✅ Backfilling row {i}: {cidade} ({estado}) → "
+            f"Osório={d_osorio}km, Floripa={d_floripa}km, Curitiba={d_curitiba}km"
+        )
+
+        # One update entry per row across the distance columns only
+        updates.append({
+            "range": f"{tab_name}!{osorio_letter}{i}:{curitiba_letter}{i}",
+            "values": [[d_osorio, d_floripa, d_curitiba]]
+        })
+        repaired += 1
+
+    if not updates:
+        print("ℹ️ Backfill: no rows needed repair.")
+        return
+
+    # Single batchUpdate — one API call for all repairs
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "valueInputOption": "RAW",
+            "data": updates,
+        }
+    ).execute()
+
+    safe_sheet_write(
+        "log backfill distances",
+        ws_logs_sheet.append_row,
+        [datetime.now().isoformat(), f"Backfill: {repaired} rows with missing distances repaired"],
+        value_input_option="USER_ENTERED",
+    )
+
+    print(f"📐 Backfill complete — {repaired} rows updated.")
+
+
+backfill_missing_distances(ws_concursos, ws_logs, SHEET_ID, creds)
+
+# =====================================
+# 10) Final summary feedback + safe lock release
 # =====================================
 try:
-    summary_new = f"• {added} new concursos added today." if added > 0 else "• No new concursos were added on this run."
-    summary_expired = f"• {len(ws_expired.get_all_values()) - 1} concursos currently archived (expired)."
+    summary_new = (
+        f"• {added} new concursos added today."
+        if added > 0
+        else "• No new concursos were added on this run."
+    )
+    summary_expired = (
+        f"• {len(ws_expired.get_all_values()) - 1} concursos atualmente arquivados (expirados)."
+    )
     summary_filters = f"• Filter views updated: {updated_filters_count}"
-    summary_failed = f"• Rows not saved after 3 attempts: {failed_rows}" if failed_rows else "• All rows saved successfully."
+    summary_failed = (
+        f"• Rows not saved after 3 attempts: {failed_rows}"
+        if failed_rows
+        else "• All rows saved successfully."
+    )
     print("\n📈 Summary:")
     print(summary_new)
     print(summary_expired)
@@ -457,6 +909,16 @@ try:
 except Exception as e:
     print(f"⚠️ Could not print final summary: {e}")
 
-print("🎯 All tasks completed successfully!")
-print("⏳ Keeping script open for 15 minutes for review (Ctrl+C to exit early)...")
-time.sleep(15 * 60)
+try:
+    print("🎯 All tasks completed successfully!")
+    print("⏳ Keeping script open for 15 minutes for review (Ctrl+C to exit early)...")
+    time.sleep(15 * 60)
+except KeyboardInterrupt:
+    print("⛔ Interrupted by user (Ctrl+C). Cleaning up and exiting...")
+finally:
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            print(f"🔓 Lock released: {LOCK_FILE}")
+    except Exception as e:
+        print(f"⚠️ Could not remove lock file {LOCK_FILE}: {e}")
