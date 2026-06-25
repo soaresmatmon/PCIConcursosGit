@@ -16,9 +16,13 @@ from googleapiclient.discovery import build
 print(">>> RUNNING concursos.py v2026-06-09-col-H <<<")
 
 # =====================================
-# 0) Single-instance lock (interactive for manual runs)
+# SYSTEM PATH CONFIGURATION (Dynamic & Portable)
 # =====================================
-LOCK_FILE = r"C:\Users\mateu\OneDrive\Área de Trabalho\Concursos\pci_concursos.lock"
+# Automatically finds the folder where Concursos.py is living
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Defines lock file relative to that folder (No usernames exposed!)
+LOCK_FILE = os.path.join(BASE_DIR, "pci_concursos.lock")
 
 
 def acquire_lock_interactive():
@@ -99,7 +103,9 @@ def safe_sheet_write(action_desc, func, *args, **kwargs):
 # 2) Google Sheets Authentication (Service Account)
 # =====================================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SERVICE_ACCOUNT_FILE = r"C:\Users\mateu\OneDrive\Área de Trabalho\Concursos\pci-concursos-tracker-1eedab4e1dbd.json"
+
+# Tells the script to look for the JSON file right inside your Git project folder
+SERVICE_ACCOUNT_FILE = os.path.join(BASE_DIR, "pci-concursos-tracker-1eedab4e1dbd.json")
 
 try:
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
