@@ -1,2 +1,9 @@
+# Ignore the secret Google credential keys
 *.json
+
+# Ignore local automation locks
 *.lock
+
+# Ignore local python cache folders
+__pycache__/
+.pytest_cache/
