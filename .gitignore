@@ -1,0 +1,10 @@
+token.pickle
+
+credentials/
+
+__pycache__/
+
+*.log
+
+venv/
+.venv/
