@@ -4,12 +4,12 @@ This document details the multi-stage ETL (Extract, Transform, Load) design of t
 
 ```mermaid
 graph TD
-    %% Define Styles with Explicit High-Contrast Dark Text
-    classDef init fill:#f9f,stroke:#333,stroke-width:2px,color:#111;
-    classDef process fill:#bbf,stroke:#333,stroke-width:1px,color:#111;
-    classDef storage fill:#ffb,stroke:#333,stroke-width:1px,color:#111;
-    classDef network fill:#bfb,stroke:#333,stroke-width:1px,color:#111;
-    classDef conditional fill:#fff,stroke:#333,stroke-width:1px,color:#111;
+    %% Universal High-Contrast Palette (Deep Fills + White Text)
+    classDef init fill:#4A148C,stroke:#FFFFFF,stroke-width:2px,color:#FFFFFF;
+    classDef process fill:#0D47A1,stroke:#FFFFFF,stroke-width:1px,color:#FFFFFF;
+    classDef storage fill:#E65100,stroke:#FFFFFF,stroke-width:1px,color:#FFFFFF;
+    classDef network fill:#1B5E20,stroke:#FFFFFF,stroke-width:1px,color:#FFFFFF;
+    classDef conditional fill:#424242,stroke:#FFFFFF,stroke-width:1px,color:#FFFFFF;
 
     %% Concurrency Lock Stage
     Start([Execute Script]) --> LockCheck{Is .lock file present?}:::conditional
