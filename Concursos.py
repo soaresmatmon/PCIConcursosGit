@@ -128,10 +128,45 @@ ws_logs = get_or_create_worksheet(sheet, "logs", 5)
 ws_geo = get_or_create_worksheet(sheet, "geocodes_cache", 4)
 
 # =====================================
-# 4) Load geocode cache
+# 4) Load geocode cache + municipios_ref
 # =====================================
-geo_records = ws_geo.get_all_records()
-geo_cache = {r["cidade"].lower(): (r["lat"], r["lon"]) for r in geo_records if "cidade" in r}
+# FIX: expected_headers evita crash quando geocodes_cache tem colunas vazias no cabeçalho
+geo_records = ws_geo.get_all_records(expected_headers=["cidade", "lat", "lon"])
+geo_cache = {}
+
+for r in geo_records:
+    cidade = normalize_text(str(r.get("cidade", "")).strip())
+
+    try:
+        lat = float(r.get("lat"))
+        lon = float(r.get("lon"))
+    except:
+        continue
+
+    geo_cache[cidade] = (lat, lon)
+
+# Carrega a tabela de municípios brasileiros (lat/lon offline, sem depender do Nominatim)
+try:
+    ws_mun = sheet.worksheet("municipios_ref")
+    mun_records = ws_mun.get_all_records(expected_headers=["cidade", "estado", "codigo_ibge", "lat", "lon"])
+    # Índice duplo: (cidade_lower, estado_upper) → (lat, lon)
+    # e cidade_lower sozinha como fallback (pega o primeiro encontrado)
+    municipios_ref: dict[tuple, tuple] = {}
+    municipios_ref_cidade: dict[str, tuple] = {}
+    for m in mun_records:
+        c = normalize_text(str(m.get("cidade", "")).strip())
+        e = str(m.get("estado", "")).strip().upper()
+        lat = m.get("lat")
+        lon = m.get("lon")
+        if c and lat and lon:
+            municipios_ref[(c, e)] = (float(lat), float(lon))
+            if c not in municipios_ref_cidade:
+                municipios_ref_cidade[c] = (float(lat), float(lon))
+    print(f"✅ municipios_ref carregado: {len(municipios_ref)} municípios")
+except Exception as e:
+    municipios_ref = {}
+    municipios_ref_cidade = {}
+    print(f"⚠️ Não foi possível carregar municipios_ref: {e}")
 
 # ─────────────────────────────────────────────────────────────────────
 # FIX 1: get_city_coords — include estado in query, log empty
@@ -146,43 +181,76 @@ NOMINATIM_UA = "PCI-Concursos-Tracker/2.0 (mateus.concursos@example.com)"
 
 def get_city_coords(city, estado=None):
     """
-    Geocode `city` via Nominatim.
+    Geocode `city` com três camadas de prioridade:
 
-    FIX 1a – estado is now used in the query string, removing ambiguity
-              for small/common city names (e.g. "São Martinho" exists in
-              multiple states; without the state Nominatim may return the
-              wrong one or nothing at all).
-
-    FIX 1b – Empty-response logging: the original code had no output when
-              Nominatim returned status 200 + [] (empty list). These failures
-              were completely invisible in the logs, making debugging
-              impossible. Now they are always printed.
-
-    FIX 1c – 429 / rate-limit handling: if Nominatim returns HTTP 429 we
-              back off exponentially instead of crashing silently.
-
-    FIX 1d – Policy-compliant User-Agent (see NOMINATIM_UA above).
+    1. geo_cache  — resultado de runs anteriores (já gravado no geocodes_cache)
+    2. municipios_ref — tabela offline com todos os municípios brasileiros;
+                        elimina chamadas ao Nominatim para a imensa maioria dos casos.
+    3. Nominatim  — fallback online apenas para cidades não encontradas nas duas
+                    fontes acima (municípios muito novos, grafias alternativas, etc.)
     """
-    city_norm = city.lower().strip()
+    city_norm = normalize_text(city.strip())
+    estado_norm = (estado or "").strip().upper()
+
+    # Camada 1 — cache de runs anteriores
     if city_norm in geo_cache:
         return geo_cache[city_norm]
 
-    # Build query — prefer city + state for specificity
+    # Camada 2 — municipios_ref (lookup offline, instantâneo)
+    coords = municipios_ref.get((city_norm, estado_norm))
+    if coords is None and city_norm in municipios_ref_cidade:
+        coords = municipios_ref_cidade[city_norm]
+        if estado_norm:
+            print(f"ℹ️ municipios_ref: '{city}' encontrado sem confirmar estado '{estado_norm}'")
+    if coords:
+        geo_cache[city_norm] = coords
+        return coords
+
+    # Camada 2.5 — Split + fuzzy (nomes compostos como "Timbó, SAMAE e TIMBOPREV")
+    #
+    # Estratégia E:
+    #   a) Pega o trecho antes da primeira vírgula (ex: "Timbó") e tenta lookup exato.
+    #   b) Se ainda falhar, roda difflib.get_close_matches contra todos os municípios
+    #      do mesmo estado com threshold 0.85 — evita falsos positivos.
+    #   c) Só chega no Nominatim se as duas etapas acima falharem.
+    if "," in city:
+        city_before_comma = normalize_text(city.split(",")[0].strip())
+        # (a) lookup exato com o trecho antes da vírgula
+        coords = municipios_ref.get((city_before_comma, estado_norm))
+        if coords is None and city_before_comma in municipios_ref_cidade:
+            coords = municipios_ref_cidade[city_before_comma]
+        if coords:
+            print(f"✂️ Split-match: '{city}' resolvido como '{city.split(',')[0].strip()}'")
+            geo_cache[city_norm] = coords
+            return coords
+
+        # (b) fuzzy matching restrito ao mesmo estado
+        import difflib
+        candidates = [c for (c, e) in municipios_ref if e == estado_norm] if estado_norm else list(municipios_ref_cidade.keys())
+        matches = difflib.get_close_matches(city_before_comma, candidates, n=1, cutoff=0.85)
+        if matches:
+            matched_key = matches[0]
+            coords = municipios_ref.get((matched_key, estado_norm)) or municipios_ref_cidade.get(matched_key)
+            if coords:
+                print(f"🔍 Fuzzy-match: '{city}' → '{matched_key}' (estado={estado_norm})")
+                geo_cache[city_norm] = coords
+                return coords
+
+    # Camada 3 — Nominatim (fallback online)
     query = f"{city}, {estado}, Brasil" if estado else f"{city}, Brasil"
-    print(f"🌍 Geocoding: {query}")
+    print(f"🌍 Nominatim fallback: {query}")
 
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": query, "format": "json", "limit": 1, "countrycodes": "br"}
-    headers = {"User-Agent": NOMINATIM_UA}
+    req_headers = {"User-Agent": NOMINATIM_UA}
 
     for attempt in range(3):
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            resp = requests.get(url, params=params, headers=req_headers, timeout=10)
 
-            # FIX 1c — explicit 429 handling
             if resp.status_code == 429:
                 wait_s = 30 * (attempt + 1)
-                print(f"⏳ Nominatim rate-limited (429). Waiting {wait_s}s before retry {attempt + 1}/3…")
+                print(f"⏳ Nominatim rate-limited (429). Aguardando {wait_s}s (tentativa {attempt + 1}/3)…")
                 time.sleep(wait_s)
                 continue
 
@@ -192,22 +260,21 @@ def get_city_coords(city, estado=None):
                     lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
                     geo_cache[city_norm] = (lat, lon)
                     safe_sheet_write(
-                        "update geocode cache",
+                        f"cache Nominatim → geocodes_cache: {city}",
                         ws_geo.append_row,
                         [city, lat, lon, datetime.now().isoformat()],
                         value_input_option="RAW",
                     )
-                    time.sleep(1.5)  # more conservative than the old 1 s
+                    time.sleep(1.5)
                     return lat, lon
                 else:
-                    # FIX 1b — log the empty response (was completely silent before)
-                    print(f"⚠️ Nominatim returned 0 results for: '{query}'. City may be too small or name too ambiguous.")
-                    break  # no point retrying an empty result
+                    print(f"⚠️ Nominatim sem resultados para: '{query}'.")
+                    break
             else:
-                print(f"⚠️ Nominatim HTTP {resp.status_code} for '{query}'.")
+                print(f"⚠️ Nominatim HTTP {resp.status_code} para '{query}'.")
 
         except Exception as e:
-            print(f"⚠️ Erro ao geocodificar '{city}' (attempt {attempt + 1}/3): {e}")
+            print(f"⚠️ Erro ao geocodificar '{city}' (tentativa {attempt + 1}/3): {e}")
 
         if attempt < 2:
             time.sleep(5 * (attempt + 1))
